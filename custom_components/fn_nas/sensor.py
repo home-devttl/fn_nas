@@ -3,16 +3,25 @@ from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, Sen
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.const import UnitOfTemperature
 from .const import (
-    DOMAIN, HDD_TEMP, HDD_STATUS, SYSTEM_INFO, ICON_DISK, 
-    ICON_TEMPERATURE, ATTR_DISK_MODEL, ATTR_SERIAL_NO,
+    DOMAIN, ATTR_DISK_MODEL, ATTR_SERIAL_NO,
     ATTR_POWER_ON_HOURS, ATTR_TOTAL_CAPACITY, ATTR_HEALTH_STATUS,
-    DEVICE_ID_NAS, DATA_UPDATE_COORDINATOR, ZFS_POOL, ICON_ZFS,
+    DATA_UPDATE_COORDINATOR, ICON_ZFS,
     ATTR_ZPOOL_NAME, ATTR_ZPOOL_HEALTH, ATTR_ZPOOL_SIZE,
     ATTR_ZPOOL_ALLOC, ATTR_ZPOOL_FREE, ATTR_ZPOOL_CAPACITY,
     ATTR_ZPOOL_FRAGMENTATION, ATTR_ZPOOL_CKPOINT, ATTR_ZPOOL_EXPANDSZ,
     ATTR_ZPOOL_DEDUP, ATTR_ZPOOL_SCRUB_STATUS, ATTR_ZPOOL_SCRUB_PROGRESS,
     ATTR_ZPOOL_SCRUB_SCAN_RATE, ATTR_ZPOOL_SCRUB_TIME_REMAINING,
-    ATTR_ZPOOL_SCRUB_ISSUED, ATTR_ZPOOL_SCRUB_REPAIRED, DEVICE_ID_ZFS
+    ATTR_ZPOOL_SCRUB_ISSUED, ATTR_ZPOOL_SCRUB_REPAIRED
+)
+from .entity_helpers import (
+    child_identifier,
+    disk_key,
+    find_disk,
+    is_known_value,
+    nas_identifier,
+    nas_via_device,
+    sanitize_id,
+    zfs_identifier,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -24,44 +33,23 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     
     entities = []
     existing_ids = set()
+    disks = coordinator.data.get("disks", [])
     
     # 添加硬盘传感器
-    for disk in coordinator.data.get("disks", []):
-        # 温度传感器
-        temp_uid = f"{config_entry.entry_id}_{disk['device']}_temperature"
-        if temp_uid not in existing_ids:
+    for disk in disks:
+        stable_disk_key = disk_key(disk)
+        health_uid = f"{config_entry.entry_id}_disk_{stable_disk_key}_health"
+        if health_uid not in existing_ids:
             entities.append(
                 DiskSensor(
                     coordinator, 
-                    disk["device"], 
-                    HDD_TEMP,
-                    f"硬盘 {disk.get('model', '未知')} 温度",
-                    temp_uid,
-                    UnitOfTemperature.CELSIUS,
-                    ICON_TEMPERATURE,
+                    stable_disk_key,
+                    disk["device"],
+                    health_uid,
                     disk
                 )
             )
-            existing_ids.add(temp_uid)
-        
-
-        
-        # 硬盘状态传感器
-        status_uid = f"{config_entry.entry_id}_{disk['device']}_status"
-        if status_uid not in existing_ids:
-            entities.append(
-                DiskSensor(
-                    coordinator, 
-                    disk["device"], 
-                    HDD_STATUS,
-                    f"硬盘 {disk.get('model', '未知')} 状态",
-                    status_uid,
-                    None,
-                    ICON_DISK,
-                    disk
-                )
-            )
-            existing_ids.add(status_uid)
+            existing_ids.add(health_uid)
     
     # 添加系统信息传感器
     system_uid = f"{config_entry.entry_id}_system_status"
@@ -105,10 +93,32 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         )
         existing_ids.add(mobo_temp_uid)
 
+    system_metric_sensors = (
+        ("cpu_usage", "CPU使用率", "%", "mdi:cpu-64-bit"),
+        ("network_download_speed", "网络下载速度", "MB/s", "mdi:download-network"),
+        ("network_upload_speed", "网络上传速度", "MB/s", "mdi:upload-network"),
+        ("storage_read_speed", "存储读取速度", "MB/s", "mdi:download"),
+        ("storage_write_speed", "存储写入速度", "MB/s", "mdi:upload"),
+    )
+    for data_key, name, unit, icon in system_metric_sensors:
+        metric_uid = f"{config_entry.entry_id}_{data_key}"
+        if metric_uid not in existing_ids:
+            entities.append(
+                SystemMetricSensor(
+                    coordinator,
+                    name,
+                    metric_uid,
+                    unit,
+                    icon,
+                    data_key,
+                )
+            )
+            existing_ids.add(metric_uid)
+
     # 添加虚拟机状态传感器
     if "vms" in coordinator.data:
         for vm in coordinator.data["vms"]:
-            vm_uid = f"{config_entry.entry_id}_flynas_vm_{vm['name']}_status"
+            vm_uid = f"{config_entry.entry_id}_flynas_vm_{sanitize_id(vm['name'])}_status"
             if vm_uid not in existing_ids:
                 entities.append(
                     VMStatusSensor(
@@ -122,8 +132,6 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
 
     # 添加UPS传感器（使用UPS协调器）
     if ups_coordinator.data:  # 检查是否有UPS数据
-        ups_data = ups_coordinator.data
-        
         # UPS电池电量传感器
         ups_battery_uid = f"{config_entry.entry_id}_ups_battery"
         if ups_battery_uid not in existing_ids:
@@ -220,43 +228,26 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
             )
             existing_ids.add(ups_status_uid)
 
-        if coordinator.data.get("docker_containers") and coordinator.enable_docker:
-            for container in coordinator.data["docker_containers"]:
-                safe_name = container["name"].replace(" ", "_").replace("/", "_")
-                sensor_uid = f"{config_entry.entry_id}_docker_{safe_name}_status"
-                if sensor_uid not in existing_ids:
-                    entities.append(
-                        DockerContainerStatusSensor(
-                            coordinator, 
-                            container["name"],
-                            safe_name,
-                            config_entry.entry_id
-                        )
+    if coordinator.data.get("docker_containers") and coordinator.enable_docker:
+        for container in coordinator.data["docker_containers"]:
+            safe_name = sanitize_id(container["name"])
+            sensor_uid = f"{config_entry.entry_id}_docker_{safe_name}_status"
+            if sensor_uid not in existing_ids:
+                entities.append(
+                    DockerContainerStatusSensor(
+                        coordinator,
+                        container["name"],
+                        safe_name,
+                        config_entry.entry_id
                     )
-                    existing_ids.add(sensor_uid)
+                )
+                existing_ids.add(sensor_uid)
     
     # 添加ZFS存储池传感器
     if "zpools" in coordinator.data:
         for zpool in coordinator.data["zpools"]:
-            safe_name = zpool["name"].replace(" ", "_").replace("/", "_").replace(".", "_")
-            
-            # ZFS存储池健康状态传感器
-            health_uid = f"{config_entry.entry_id}_zpool_{safe_name}_health"
-            if health_uid not in existing_ids:
-                entities.append(
-                    ZFSPoolSensor(
-                        coordinator,
-                        zpool["name"],
-                        "health",
-                        f"ZFS {zpool['name']} 健康状态",
-                        health_uid,
-                        None,
-                        ICON_ZFS,
-                        zpool
-                    )
-                )
-                existing_ids.add(health_uid)
-            
+            safe_name = sanitize_id(zpool["name"])
+
             # ZFS存储池容量使用率传感器
             capacity_uid = f"{config_entry.entry_id}_zpool_{safe_name}_capacity"
             if capacity_uid not in existing_ids:
@@ -275,24 +266,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
                     )
                 )
                 existing_ids.add(capacity_uid)
-            
-            # ZFS存储池总大小传感器
-            size_uid = f"{config_entry.entry_id}_zpool_{safe_name}_size"
-            if size_uid not in existing_ids:
-                entities.append(
-                    ZFSPoolSensor(
-                        coordinator,
-                        zpool["name"],
-                        "size",
-                        f"ZFS {zpool['name']} 容量",
-                        size_uid,
-                        None,  # 动态确定单位
-                        ICON_ZFS,
-                        zpool
-                    )
-                )
-                existing_ids.add(size_uid)
-            
+
             # ZFS存储池scrub进度传感器
             scrub_uid = f"{config_entry.entry_id}_zpool_{safe_name}_scrub"
             if scrub_uid not in existing_ids:
@@ -342,66 +316,53 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
 
 
 class DiskSensor(CoordinatorEntity, SensorEntity):
-    def __init__(self, coordinator, device_id, sensor_type, name, unique_id, unit, icon, disk_info):
+    def __init__(self, coordinator, disk_id, fallback_device, unique_id, disk_info):
         super().__init__(coordinator)
-        self.device_id = device_id
-        self.sensor_type = sensor_type
-        self._attr_name = name
+        self.disk_id = disk_id
+        self.fallback_device = fallback_device
+        disk_label = disk_info.get("serial") if is_known_value(disk_info.get("serial")) else disk_info.get("model", "未知硬盘")
+        self._attr_has_entity_name = False
+        self._attr_name = f"硬盘 {disk_label} 信息"
         self._attr_unique_id = unique_id
-        self._attr_native_unit_of_measurement = unit
-        self._attr_icon = icon
+        self._attr_suggested_object_id = f"disk_{disk_id}_info"
+        self._attr_icon = "mdi:harddisk"
         self.disk_info = disk_info
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, f"disk_{device_id}")},
-            "name": disk_info.get("model", "未知硬盘"),
+            "identifiers": {(DOMAIN, child_identifier(coordinator, f"disk_{disk_id}"))},
+            "name": disk_label,
             "manufacturer": "硬盘设备",
-            "via_device": (DOMAIN, DEVICE_ID_NAS)
+            "model": disk_info.get("model", "未知硬盘"),
+            "via_device": nas_via_device(coordinator)
         }
     
     @property
     def native_value(self):
-        for disk in self.coordinator.data.get("disks", []):
-            if disk["device"] == self.device_id:
-                if self.sensor_type == HDD_TEMP:
-                    temp = disk.get("temperature")
-                    if temp is None or temp == "未知":
-                        return None
-                    if isinstance(temp, str):
-                        try:
-                            if "°C" in temp:
-                                return float(temp.replace("°C", "").strip())
-                            return float(temp)
-                        except ValueError:
-                            return None
-                    elif isinstance(temp, (int, float)):
-                        return temp
-                    return None
+        disk = self._current_disk
+        if not disk:
+            return "未知"
+        return disk.get("health", "未知")
 
-                elif self.sensor_type == HDD_STATUS:
-                    return disk.get("status", "未知")
-        return None
-    
     @property
-    def device_class(self):
-        if self.sensor_type == HDD_TEMP:
-            return SensorDeviceClass.TEMPERATURE
-        return None
-    
-    @property
-    def native_unit_of_measurement(self):
-        """返回内存单位"""
-        return self._attr_native_unit_of_measurement
+    def _current_disk(self):
+        return find_disk(
+            self.coordinator.data.get("disks", []),
+            self.disk_id,
+            self.fallback_device,
+        )
     
     @property
     def extra_state_attributes(self):
+        disk_info = self._current_disk or self.disk_info
         return {
-            ATTR_DISK_MODEL: self.disk_info.get("model", "未知"),
-            ATTR_SERIAL_NO: self.disk_info.get("serial", "未知"),
-            ATTR_POWER_ON_HOURS: self.disk_info.get("power_on_hours", "未知"),
-            ATTR_TOTAL_CAPACITY: self.disk_info.get("capacity", "未知"),
-            ATTR_HEALTH_STATUS: self.disk_info.get("health", "未知"),
-            "设备ID": self.device_id,
-            "状态": self.disk_info.get("status", "未知")
+            ATTR_DISK_MODEL: disk_info.get("model", "未知"),
+            ATTR_SERIAL_NO: disk_info.get("serial", "未知"),
+            "温度": disk_info.get("temperature", "未知"),
+            ATTR_POWER_ON_HOURS: disk_info.get("power_on_hours", "未知"),
+            ATTR_TOTAL_CAPACITY: disk_info.get("capacity", "未知"),
+            ATTR_HEALTH_STATUS: disk_info.get("health", "未知"),
+            "设备ID": disk_info.get("device", self.fallback_device),
+            "硬盘标识": self.disk_id,
+            "状态": disk_info.get("status", "未知")
         }
 
 class SystemSensor(CoordinatorEntity, SensorEntity):
@@ -412,7 +373,7 @@ class SystemSensor(CoordinatorEntity, SensorEntity):
         self._attr_native_unit_of_measurement = unit
         self._attr_icon = icon
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, DEVICE_ID_NAS)},
+            "identifiers": {(DOMAIN, nas_identifier(coordinator))},
             "name": "飞牛NAS系统监控",
             "manufacturer": "飞牛"
         }
@@ -451,7 +412,13 @@ class SystemSensor(CoordinatorEntity, SensorEntity):
             "系统状态": system_data.get("status", "unknown"),
             "主机地址": self.coordinator.host,
             "CPU温度": system_data.get("cpu_temperature", "未知"),
-            "主板温度": system_data.get("motherboard_temperature", "未知")
+            "主板温度": system_data.get("motherboard_temperature", "未知"),
+            "CPU使用率": system_data.get("cpu_usage"),
+            "网络下载速度": system_data.get("network_download_speed"),
+            "网络上传速度": system_data.get("network_upload_speed"),
+            "网络接口": system_data.get("network_interface", "未知"),
+            "存储读取速度": system_data.get("storage_read_speed"),
+            "存储写入速度": system_data.get("storage_write_speed")
         }
 
 class CPUTempSensor(CoordinatorEntity, SensorEntity):
@@ -462,7 +429,7 @@ class CPUTempSensor(CoordinatorEntity, SensorEntity):
         self._attr_native_unit_of_measurement = unit
         self._attr_icon = icon
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, DEVICE_ID_NAS)},
+            "identifiers": {(DOMAIN, nas_identifier(coordinator))},
             "name": "飞牛NAS系统监控",
             "manufacturer": "飞牛"
         }
@@ -497,7 +464,7 @@ class MoboTempSensor(CoordinatorEntity, SensorEntity):
         self._attr_native_unit_of_measurement = unit
         self._attr_icon = icon
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, DEVICE_ID_NAS)},
+            "identifiers": {(DOMAIN, nas_identifier(coordinator))},
             "name": "飞牛NAS系统监控",
             "manufacturer": "飞牛"
         }
@@ -524,6 +491,44 @@ class MoboTempSensor(CoordinatorEntity, SensorEntity):
             _LOGGER.warning("主板温度解析失败: 原始值='%s', 错误: %s", temp_str, str(e))
             return None
 
+class SystemMetricSensor(CoordinatorEntity, SensorEntity):
+    def __init__(self, coordinator, name, unique_id, unit, icon, data_key):
+        super().__init__(coordinator)
+        self._attr_name = name
+        self._attr_unique_id = unique_id
+        self._attr_native_unit_of_measurement = unit
+        self._attr_icon = icon
+        self.data_key = data_key
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, nas_identifier(coordinator))},
+            "name": "飞牛NAS系统监控",
+            "manufacturer": "飞牛"
+        }
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+
+    @property
+    def native_value(self):
+        system_data = self.coordinator.data.get("system", {})
+        if system_data.get("status") == "off":
+            return None
+        value = system_data.get(self.data_key)
+        if value in (None, "未知"):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def extra_state_attributes(self):
+        system_data = self.coordinator.data.get("system", {})
+        attributes = {
+            "系统状态": system_data.get("status", "unknown"),
+        }
+        if self.data_key.startswith("network_"):
+            attributes["网络接口"] = system_data.get("network_interface", "未知")
+        return attributes
+
 class UPSSensor(CoordinatorEntity, SensorEntity):
     def __init__(self, coordinator, name, unique_id, unit, icon, data_key, device_class=None, state_class=None):
         super().__init__(coordinator)
@@ -533,10 +538,10 @@ class UPSSensor(CoordinatorEntity, SensorEntity):
         self._attr_icon = icon
         self.data_key = data_key
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, "flynas_ups")},
+            "identifiers": {(DOMAIN, child_identifier(coordinator, "flynas_ups"))},
             "name": "飞牛NAS UPS",
             "manufacturer": "UPS设备",
-            "via_device": (DOMAIN, DEVICE_ID_NAS)
+            "via_device": nas_via_device(coordinator)
         }
         
         # 设置设备类和状态类（如果提供）
@@ -569,12 +574,13 @@ class VMStatusSensor(CoordinatorEntity, SensorEntity):
         super().__init__(coordinator)
         self.vm_name = vm_name
         self.vm_title = vm_title
+        safe_vm_name = sanitize_id(vm_name)
         self._attr_name = f"{vm_title} 状态"
-        self._attr_unique_id = f"{entry_id}_flynas_vm_{vm_name}_status"  # 使用entry_id确保唯一性
+        self._attr_unique_id = f"{entry_id}_flynas_vm_{safe_vm_name}_status"  # 使用entry_id确保唯一性
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, f"vm_{vm_name}")},
+            "identifiers": {(DOMAIN, child_identifier(coordinator, f"vm_{safe_vm_name}"))},
             "name": vm_title,
-            "via_device": (DOMAIN, DEVICE_ID_NAS)
+            "via_device": nas_via_device(coordinator)
         }
     
     @property
@@ -611,12 +617,13 @@ class DockerContainerStatusSensor(CoordinatorEntity, SensorEntity):
     def __init__(self, coordinator, container_name, safe_name, entry_id):
         super().__init__(coordinator)
         self.container_name = container_name
+        safe_name = sanitize_id(safe_name)
         self._attr_name = f"{container_name} 状态"
         self._attr_unique_id = f"{entry_id}_docker_{safe_name}_status"
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, f"docker_{safe_name}")},
+            "identifiers": {(DOMAIN, child_identifier(coordinator, f"docker_{safe_name}"))},
             "name": container_name,
-            "via_device": (DOMAIN, DEVICE_ID_NAS)
+            "via_device": nas_via_device(coordinator)
         }
 
     @property
@@ -644,7 +651,7 @@ class MemoryAvailableSensor(CoordinatorEntity, SensorEntity):
         self._attr_native_unit_of_measurement = unit
         self._attr_icon = icon
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, DEVICE_ID_NAS)},
+            "identifiers": {(DOMAIN, nas_identifier(coordinator))},
             "name": "飞牛NAS系统监控",
             "manufacturer": "飞牛"
         }
@@ -706,7 +713,7 @@ class VolumeAvailableSensor(CoordinatorEntity, SensorEntity):
         
         # 设备信息，归属到飞牛NAS系统
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, DEVICE_ID_NAS)},
+            "identifiers": {(DOMAIN, nas_identifier(coordinator))},
             "name": "飞牛NAS系统监控",
             "manufacturer": "飞牛"
         }
@@ -774,9 +781,9 @@ class ZFSPoolSensor(CoordinatorEntity, SensorEntity):
         self._attr_icon = icon
         self.zpool_info = zpool_info
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, DEVICE_ID_ZFS)},
+            "identifiers": {(DOMAIN, zfs_identifier(coordinator))},
             "name": "ZFS存储池",
-            "via_device": (DOMAIN, DEVICE_ID_NAS)
+            "via_device": nas_via_device(coordinator)
         }
         
         # 设置设备类和状态类（如果提供）
@@ -858,9 +865,9 @@ class ZFSScrubSensor(CoordinatorEntity, SensorEntity):
         self._attr_native_unit_of_measurement = "%"
         self._attr_icon = "mdi:progress-check"
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, DEVICE_ID_ZFS)},
+            "identifiers": {(DOMAIN, zfs_identifier(coordinator))},
             "name": "ZFS存储池",
-            "via_device": (DOMAIN, DEVICE_ID_NAS)
+            "via_device": nas_via_device(coordinator)
         }
         self._attr_device_class = SensorDeviceClass.POWER_FACTOR
         self._attr_state_class = SensorStateClass.MEASUREMENT

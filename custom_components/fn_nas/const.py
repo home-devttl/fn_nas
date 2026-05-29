@@ -3,7 +3,6 @@ from homeassistant.const import Platform
 DOMAIN = "fn_nas"
 PLATFORMS = [
     Platform.SENSOR,
-    Platform.BINARY_SENSOR,
     Platform.SWITCH,
     Platform.BUTTON
 ]

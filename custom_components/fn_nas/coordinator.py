@@ -2,6 +2,7 @@ import logging
 import asyncio
 import asyncssh
 import re
+import shlex
 from datetime import timedelta
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -25,6 +26,7 @@ class FlynasCoordinator(DataUpdateCoordinator):
         self.config = config
         self.config_entry = config_entry
         self.hass = hass
+        self.logger = _LOGGER
         self.host = config[CONF_HOST]
         self.port = config.get(CONF_PORT, DEFAULT_PORT)
         self.username = config[CONF_USERNAME]
@@ -75,6 +77,12 @@ class FlynasCoordinator(DataUpdateCoordinator):
                 "uptime": "未知",
                 "cpu_temperature": "未知",
                 "motherboard_temperature": "未知",
+                "cpu_usage": None,
+                "network_download_speed": None,
+                "network_upload_speed": None,
+                "network_interface": "未知",
+                "storage_read_speed": None,
+                "storage_write_speed": None,
                 "status": "off"
             },
             "ups": {},
@@ -176,34 +184,30 @@ class FlynasCoordinator(DataUpdateCoordinator):
                 self.use_sudo = False
                 return
             
-            # 尝试切换到root会话
+            # asyncssh.run() 不会保留交互式 root shell，后续命令统一走 sudo。
             if self.root_password:
                 try:
                     await ssh.run(
-                        f"echo '{self.root_password}' | sudo -S -i",
+                        "sudo -S -p '' true",
                         input=self.root_password + "\n",
                         timeout=5
                     )
-                    whoami = await ssh.run("whoami")
-                    if "root" in whoami.stdout:
-                        self._info_log("成功切换到 root 会话（使用 root 密码）")
-                        self.use_sudo = False
-                        return
+                    self._debug_log("root 密码 sudo 验证成功")
+                    self.use_sudo = True
+                    return
                 except Exception:
                     pass
             
             # 尝试使用登录密码sudo
             try:
                 await ssh.run(
-                    f"echo '{self.password}' | sudo -S -i",
+                    "sudo -S -p '' true",
                     input=self.password + "\n",
                     timeout=5
                 )
-                whoami = await ssh.run("whoami")
-                if "root" in whoami.stdout:
-                    self._info_log("成功切换到 root 会话（使用登录密码）")
-                    self.use_sudo = False
-                    return
+                self._debug_log("登录密码 sudo 验证成功")
+                self.use_sudo = True
+                return
             except Exception:
                 pass
                 
@@ -458,15 +462,15 @@ class FlynasCoordinator(DataUpdateCoordinator):
         """执行ZFS存储池数据一致性检查"""
         try:
             self._debug_log(f"开始对ZFS存储池 {pool_name} 执行scrub操作")
-            command = f"zpool scrub {pool_name}"
+            command = f"zpool scrub {shlex.quote(pool_name)} 2>&1 && echo __FN_NAS_SCRUB_OK__"
             result = await self.run_command(command)
             
-            if result and not result.lower().startswith("cannot"):
+            if "__FN_NAS_SCRUB_OK__" in result:
                 self._debug_log(f"ZFS存储池 {pool_name} scrub操作启动成功")
                 return True
-            else:
-                self.logger.error(f"ZFS存储池 {pool_name} scrub操作失败: {result}")
-                return False
+
+            self.logger.error(f"ZFS存储池 {pool_name} scrub操作失败: {result}")
+            return False
                 
         except Exception as e:
             self.logger.error(f"执行ZFS存储池 {pool_name} scrub操作时出错: {str(e)}", exc_info=True)

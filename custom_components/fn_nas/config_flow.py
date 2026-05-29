@@ -1,6 +1,5 @@
 import logging
 import voluptuous as vol
-import homeassistant.helpers.config_validation as cv
 import asyncssh
 import re
 from homeassistant import config_entries
@@ -38,6 +37,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             try:
                 # 保存用户输入
                 self.ssh_config = user_input
+                unique_id = f"{user_input[CONF_HOST].strip().lower()}:{user_input.get(CONF_PORT, DEFAULT_PORT)}"
+                await self.async_set_unique_id(unique_id)
+                self._abort_if_unique_id_configured()
                 
                 # 测试SSH连接
                 test_result = await self.test_connection(user_input)
@@ -45,18 +47,21 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     errors["base"] = test_result
                 else:
                     # 检查是否需要root密码
-                    conn = await self.create_ssh_connection(user_input)
-                    if await self.is_root_user(conn):
-                        # 是root用户，直接使用
-                        self.ssh_config[CONF_ROOT_PASSWORD] = self.ssh_config[CONF_PASSWORD]
-                        return await self.async_step_select_mac()
-                    elif await self.test_sudo_with_password(conn, user_input[CONF_PASSWORD]):
-                        # 非root用户但可使用密码sudo
-                        self.ssh_config[CONF_ROOT_PASSWORD] = self.ssh_config[CONF_PASSWORD]
-                        return await self.async_step_select_mac()
-                    else:
+                    conn = None
+                    try:
+                        conn = await self.create_ssh_connection(user_input)
+                        if await self.is_root_user(conn):
+                            # 是root用户，直接使用
+                            self.ssh_config[CONF_ROOT_PASSWORD] = self.ssh_config[CONF_PASSWORD]
+                            return await self.async_step_select_mac()
+                        if await self.test_sudo_with_password(conn, user_input[CONF_PASSWORD]):
+                            # 非root用户但可使用密码sudo
+                            self.ssh_config[CONF_ROOT_PASSWORD] = self.ssh_config[CONF_PASSWORD]
+                            return await self.async_step_select_mac()
                         # 无法获取root权限
                         errors["base"] = "sudo_permission_required"
+                    finally:
+                        await self.close_ssh_connection(conn)
             except Exception as e:
                 _LOGGER.error("Connection test failed: %s", str(e), exc_info=True)
                 errors["base"] = "unknown_error"
@@ -84,6 +89,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """在添加集成时选择MAC地址"""
         errors = {}
         mac_options = {}
+        conn = None
 
         try:
             conn = await self.create_ssh_connection(self.ssh_config)
@@ -92,6 +98,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except Exception as e:
             errors["base"] = f"获取网卡信息失败: {str(e)}"
             _LOGGER.error("获取网卡信息失败: %s", str(e), exc_info=True)
+        finally:
+            await self.close_ssh_connection(conn)
 
         if not mac_options:
             errors["base"] = "未找到网卡MAC地址"
@@ -151,6 +159,11 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             known_hosts=None,
             connect_timeout=10
         )
+
+    async def close_ssh_connection(self, conn):
+        if conn and not conn.is_closed():
+            conn.close()
+            await conn.wait_closed()
     
     async def is_root_user(self, conn):
         try:
@@ -162,7 +175,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def test_sudo_with_password(self, conn, password):
         try:
             result = await conn.run(
-                f"echo '{password}' | sudo -S whoami",
+                "sudo -S -p '' whoami",
                 input=password + "\n",
                 timeout=10
             )
@@ -183,8 +196,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except Exception as e:
             return f"Unexpected error: {str(e)}"
         finally:
-            if conn and not conn.is_closed():
-                conn.close()
+            await self.close_ssh_connection(conn)
     
     @staticmethod
     @callback
@@ -198,7 +210,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
         
-        data = self.config_entry.options or self.config_entry.data
+        data = {**self.config_entry.data, **self.config_entry.options}
         
         options = vol.Schema({
             vol.Optional(

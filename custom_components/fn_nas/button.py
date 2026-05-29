@@ -3,7 +3,14 @@ from homeassistant.components.button import ButtonEntity
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import (
-    DOMAIN, DATA_UPDATE_COORDINATOR, DEVICE_ID_NAS, CONF_ENABLE_DOCKER, DEVICE_ID_ZFS
+    DOMAIN, DATA_UPDATE_COORDINATOR, CONF_ENABLE_DOCKER
+)
+from .entity_helpers import (
+    child_identifier,
+    nas_identifier,
+    nas_via_device,
+    sanitize_id,
+    zfs_identifier,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -42,7 +49,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     if enable_docker and "docker_containers" in coordinator.data:
         for container in coordinator.data["docker_containers"]:
             # 使用容器名称生成安全ID（替换特殊字符）
-            safe_name = container["name"].replace(" ", "_").replace("/", "_").replace(".", "_")
+            safe_name = sanitize_id(container["name"])
             entities.append(
                 DockerContainerRestartButton(
                     coordinator, 
@@ -55,7 +62,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     # 4. 添加ZFS存储池scrub按钮
     if "zpools" in coordinator.data:
         for zpool in coordinator.data["zpools"]:
-            safe_name = zpool["name"].replace(" ", "_").replace("/", "_").replace(".", "_")
+            safe_name = sanitize_id(zpool["name"])
             entities.append(
                 ZpoolScrubButton(
                     coordinator, 
@@ -74,7 +81,7 @@ class RebootButton(CoordinatorEntity, ButtonEntity):
         self._attr_unique_id = f"{entry_id}_flynas_reboot"
         self._attr_entity_category = EntityCategory.CONFIG
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, DEVICE_ID_NAS)},
+            "identifiers": {(DOMAIN, nas_identifier(coordinator))},
             "name": "飞牛NAS系统",
             "manufacturer": "飞牛",
             "model": "飞牛NAS"
@@ -95,12 +102,13 @@ class VMRebootButton(CoordinatorEntity, ButtonEntity):
         super().__init__(coordinator)
         self.vm_name = vm_name
         self.vm_title = vm_title
+        safe_vm_name = sanitize_id(vm_name)
         self._attr_name = f"{vm_title} 重启"
-        self._attr_unique_id = f"{entry_id}_flynas_vm_{vm_name}_reboot"
+        self._attr_unique_id = f"{entry_id}_flynas_vm_{safe_vm_name}_reboot"
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, f"vm_{vm_name}")},
+            "identifiers": {(DOMAIN, child_identifier(coordinator, f"vm_{safe_vm_name}"))},
             "name": vm_title,
-            "via_device": (DOMAIN, DEVICE_ID_NAS)
+            "via_device": nas_via_device(coordinator)
         }
 
         self.vm_manager = coordinator.vm_manager if hasattr(coordinator, 'vm_manager') else None
@@ -119,9 +127,6 @@ class VMRebootButton(CoordinatorEntity, ButtonEntity):
                     if vm["name"] == self.vm_name:
                         vm["state"] = "rebooting"
                 self.async_write_ha_state()
-                
-                # 在下次更新时恢复实际状态
-                self.coordinator.async_add_listener(self.async_write_ha_state)
         except Exception as e:
             _LOGGER.error("重启虚拟机时出错: %s", str(e), exc_info=True)
 
@@ -129,13 +134,13 @@ class DockerContainerRestartButton(CoordinatorEntity, ButtonEntity):
     def __init__(self, coordinator, container_name, safe_name, entry_id):
         super().__init__(coordinator)
         self.container_name = container_name
-        self.safe_name = safe_name
+        self.safe_name = sanitize_id(safe_name)
         self._attr_name = f"{container_name} 重启"
-        self._attr_unique_id = f"{entry_id}_docker_{safe_name}_restart"
+        self._attr_unique_id = f"{entry_id}_docker_{self.safe_name}_restart"
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, f"docker_{safe_name}")},
+            "identifiers": {(DOMAIN, child_identifier(coordinator, f"docker_{self.safe_name}"))},
             "name": container_name,
-            "via_device": (DOMAIN, DEVICE_ID_NAS)
+            "via_device": nas_via_device(coordinator)
         }
         self._attr_icon = "mdi:docker"
 
@@ -160,7 +165,7 @@ class DockerContainerRestartButton(CoordinatorEntity, ButtonEntity):
                 _LOGGER.info("Docker容器 %s 重启命令已发送", self.container_name)
                 
                 # 强制刷新状态（因为容器重启可能需要时间）
-                self.coordinator.async_request_refresh()
+                await self.coordinator.async_request_refresh()
             else:
                 _LOGGER.error("Docker容器 %s 重启失败", self.container_name)
                 # 恢复原始状态
@@ -190,12 +195,13 @@ class VMDestroyButton(CoordinatorEntity, ButtonEntity):
         super().__init__(coordinator)
         self.vm_name = vm_name
         self.vm_title = vm_title
+        safe_vm_name = sanitize_id(vm_name)
         self._attr_name = f"{vm_title} 强制关机"
-        self._attr_unique_id = f"{entry_id}_flynas_vm_{vm_name}_destroy"
+        self._attr_unique_id = f"{entry_id}_flynas_vm_{safe_vm_name}_destroy"
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, f"vm_{vm_name}")},
+            "identifiers": {(DOMAIN, child_identifier(coordinator, f"vm_{safe_vm_name}"))},
             "name": vm_title,
-            "via_device": (DOMAIN, DEVICE_ID_NAS)
+            "via_device": nas_via_device(coordinator)
         }
         self._attr_icon = "mdi:power-off"  # 使用关机图标
 
@@ -215,9 +221,6 @@ class VMDestroyButton(CoordinatorEntity, ButtonEntity):
                     if vm["name"] == self.vm_name:
                         vm["state"] = "destroying"
                 self.async_write_ha_state()
-                
-                # 在下次更新时恢复实际状态
-                self.coordinator.async_add_listener(self.async_write_ha_state)
         except Exception as e:
             _LOGGER.error("强制关机虚拟机时出错: %s", str(e), exc_info=True)
 
@@ -234,13 +237,13 @@ class ZpoolScrubButton(CoordinatorEntity, ButtonEntity):
     def __init__(self, coordinator, zpool_name, safe_name, entry_id):
         super().__init__(coordinator)
         self.zpool_name = zpool_name
-        self.safe_name = safe_name
+        self.safe_name = sanitize_id(safe_name)
         self._attr_name = f"ZFS {zpool_name} 数据检查"
-        self._attr_unique_id = f"{entry_id}_zpool_{safe_name}_scrub"
+        self._attr_unique_id = f"{entry_id}_zpool_{self.safe_name}_scrub"
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, DEVICE_ID_ZFS)},
+            "identifiers": {(DOMAIN, zfs_identifier(coordinator))},
             "name": "ZFS存储池",
-            "via_device": (DOMAIN, DEVICE_ID_NAS)
+            "via_device": nas_via_device(coordinator)
         }
         self._attr_icon = "mdi:harddisk-check"
 
@@ -256,18 +259,18 @@ class ZpoolScrubButton(CoordinatorEntity, ButtonEntity):
             # 检查是否已经有scrub在进行中
             scrub_status = self.coordinator.data.get("scrub_status", {}).get(self.zpool_name, {})
             if scrub_status.get("scrub_in_progress", False):
-                self.coordinator.logger.warning(f"ZFS存储池 {self.zpool_name} 已在进行数据一致性检查")
+                _LOGGER.warning("ZFS存储池 %s 已在进行数据一致性检查", self.zpool_name)
                 return
             
             success = await self.coordinator.scrub_zpool(self.zpool_name)
             if success:
-                self.coordinator.logger.info(f"ZFS存储池 {self.zpool_name} 数据一致性检查启动成功")
+                _LOGGER.info("ZFS存储池 %s 数据一致性检查启动成功", self.zpool_name)
                 # 立即刷新状态以更新按钮状态
                 await self.coordinator.async_request_refresh()
             else:
-                self.coordinator.logger.error(f"ZFS存储池 {self.zpool_name} 数据一致性检查启动失败")
+                _LOGGER.error("ZFS存储池 %s 数据一致性检查启动失败", self.zpool_name)
         except Exception as e:
-            self.coordinator.logger.error(f"启动ZFS存储池 {self.zpool_name} 数据一致性检查时出错: {str(e)}", exc_info=True)
+            _LOGGER.error("启动ZFS存储池 %s 数据一致性检查时出错: %s", self.zpool_name, str(e), exc_info=True)
     
     @property
     def extra_state_attributes(self):

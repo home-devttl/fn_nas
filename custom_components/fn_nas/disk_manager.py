@@ -2,6 +2,7 @@ import re
 import logging
 import asyncio
 from .const import CONF_IGNORE_DISKS
+from .entity_helpers import is_known_value
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,6 +36,24 @@ class DiskManager:
         
         self.logger.debug("No match found for patterns: %s", patterns)
         return default
+
+    async def _get_disk_serial_fallback(self, device_path: str) -> str:
+        """Get disk serial from kernel/udev when smartctl does not expose it."""
+        lsblk_output = await self.coordinator.run_command(f"lsblk -dno SERIAL {device_path} 2>/dev/null")
+        for line in lsblk_output.splitlines():
+            serial = line.strip()
+            if is_known_value(serial):
+                return serial
+
+        udev_output = await self.coordinator.run_command(
+            f"udevadm info --query=property --name={device_path} 2>/dev/null"
+        )
+        for key in ("ID_SERIAL_SHORT", "ID_SERIAL", "ID_WWN"):
+            match = re.search(rf"^{key}=(.+)$", udev_output, re.MULTILINE)
+            if match and is_known_value(match.group(1)):
+                return match.group(1).strip()
+
+        return "未知"
     
     def _format_capacity(self, capacity_str: str) -> str:
         """将容量字符串格式化为GB或TB格式"""
@@ -91,6 +110,109 @@ class DiskManager:
         except Exception as e:
             self.logger.debug(f"格式化容量失败: {capacity_str}, 错误: {e}")
             return capacity_str
+
+    def _is_scsi_disk(self, info_output: str, disk_info: dict) -> bool:
+        """判断是否为SCSI/SAS协议磁盘。"""
+        device_name = disk_info.get("device", "").lower()
+        output = info_output.lower() if info_output else ""
+        return (
+            "transport protocol: sas" in output
+            or "scsi" in output
+            or "scsi_version" in output
+            or "scsi version" in output
+            or device_name.startswith("sd")
+        ) and "nvme" not in device_name
+
+    def _extract_disk_temperature(self, data_output: str, is_nvme: bool, is_scsi: bool) -> str:
+        """从SMART属性中提取当前温度。"""
+        if not data_output:
+            return "未知"
+
+        priority_patterns = []
+        if is_scsi:
+            priority_patterns.extend([
+                r"Current Drive Temperature:\s*(\d+)\s*C",
+                r"Current Drive Temperature:\s*(\d+)\s*Celsius",
+                r"Drive Temperature:\s*(\d+)\s*C",
+                r"Temperature Warning:\s+(?:Enabled|Disabled)\s+(\d+)\s+Celsius",
+            ])
+        if is_nvme:
+            priority_patterns.extend([
+                r"Temperature:\s*(\d+)\s*Celsius",
+                r"Composite:\s*\+?(\d+\.?\d*)\s*°?C",
+            ])
+
+        priority_patterns.extend([
+            r"^\s*194\s+Temperature_Celsius\b[^\n]*\s+(\d+)(?:\s*\(|\s*$)",
+            r"^\s*190\s+Airflow_Temperature_Cel\b[^\n]*\s+(\d+)(?:\s*\(|\s*$)",
+            r"Current Temperature:\s*(\d+)",
+            r"\bTemperature_Celsius\b[^\n]*\s+(\d+)(?:\s*\(|\s*$)",
+        ])
+
+        for pattern in priority_patterns:
+            match = re.search(pattern, data_output, re.IGNORECASE | re.MULTILINE)
+            if match:
+                try:
+                    temp = float(match.group(1))
+                    if 0 < temp < 120:
+                        return f"{int(temp) if temp.is_integer() else temp} °C"
+                except (TypeError, ValueError):
+                    continue
+
+        return "未知"
+
+    def _extract_power_on_hours(self, data_output: str, is_nvme: bool, is_scsi: bool) -> str:
+        """从SMART属性中提取通电时间。"""
+        if not data_output:
+            return "未知"
+
+        patterns = []
+        if is_nvme:
+            patterns.extend([
+                r"Power On Hours\s*:\s*([\d,]+)",
+                r"Power On Time\s*:\s*([\d,]+)",
+                r"Power on hours\s*:\s*([\d,]+)",
+                r"Power on time\s*:\s*([\d,]+)",
+            ])
+        if is_scsi:
+            patterns.extend([
+                r"Accumulated power on time,\s*hours:minutes\s+(\d+):(\d+)",
+                r"number of hours powered up\s*=\s*([\d.]+)",
+                r"Power on time:\s*(\d+)\s*hours",
+                r"Power-on Hours:\s*(\d+)",
+            ])
+
+        patterns.extend([
+            r"^\s*9\s+Power_On_Hours\b[^\n]+\s+(\d+)h(?:\+(\d+)m(?:\+\d+\.\d+s)?)?",
+            r"^\s*9\s+Power_On_Hours\b[^\n]*-\s*(\d+)(?:\s|$)",
+            r"^\s*9\s+Power_On_Hours\b[^\n]+\s+(\d+)\s*$",
+            r"^\s*9\s+Power On Hours\b[^\n]+\s+(\d+)h(?:\+(\d+)m(?:\+\d+\.\d+s)?)?",
+            r"Power On Hours\s+(\d+)",
+            r"Power on time\s*:\s*(\d+)\s*hours",
+        ])
+
+        for pattern in patterns:
+            match = re.search(pattern, data_output, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+            if not match:
+                continue
+            try:
+                hours = float(match.group(1).replace(",", ""))
+                if len(match.groups()) > 1 and match.group(2):
+                    hours += int(match.group(2)) / 60
+                if hours < 0:
+                    continue
+                return f"{hours:.1f} 小时" if hours % 1 else f"{int(hours)} 小时"
+            except (TypeError, ValueError):
+                continue
+
+        for line in data_output.splitlines():
+            if "Power_On_Hours" not in line:
+                continue
+            fields = line.split()
+            if fields and fields[-1].isdigit():
+                return f"{int(fields[-1])} 小时"
+
+        return "未知"
     
     async def check_disk_active(self, device: str, window: int = 30, current_status: str = None) -> bool:
         """检查硬盘在指定时间窗口内是否有活动"""
@@ -417,8 +539,9 @@ class DiskManager:
         info_output = await self.coordinator.run_command(f"smartctl -i {device_path}")
         self.logger.debug("smartctl -i output for %s: %s", disk_info["device"], info_output[:200] + "..." if len(info_output) > 200 else info_output)
         
-        # 检查是否为NVMe设备
+        # 检查是否为NVMe/SCSI设备
         is_nvme = "nvme" in disk_info["device"].lower()
+        is_scsi = self._is_scsi_disk(info_output, disk_info)
         
         # 模型 - 增强NVMe支持
         disk_info["model"] = self.extract_value(
@@ -427,6 +550,8 @@ class DiskManager:
                 r"Device Model:\s*(.+)",
                 r"Model(?: Family)?\s*:\s*(.+)",
                 r"Model Number:\s*(.+)",
+                r"Product:\s*(.+)",
+                r"Vendor:\s*(.+)",
                 r"Product:\s*(.+)",  # NVMe格式
                 r"Model Number:\s*(.+)",  # NVMe格式
             ]
@@ -439,8 +564,13 @@ class DiskManager:
                 r"Serial Number\s*:\s*(.+)",
                 r"Serial Number:\s*(.+)",  # NVMe格式
                 r"Serial\s*:\s*(.+)",  # NVMe格式
+                r"LU WWN Device Id:\s*(.+)",
             ]
         )
+        if not is_known_value(disk_info["serial"]):
+            fallback_serial = await self._get_disk_serial_fallback(device_path)
+            if is_known_value(fallback_serial):
+                disk_info["serial"] = fallback_serial
         
         # 容量 - 增强NVMe支持并转换为GB/TB格式
         capacity_patterns = [
@@ -459,7 +589,8 @@ class DiskManager:
             health_output,
             [
                 r"SMART overall-health self-assessment test result:\s*(.+)",
-                r"SMART Health Status:\s*(.+)"
+                r"SMART Health Status:\s*(.+)",
+                r"SMART Health Status:\s*(\w+)",
             ],
             default="UNKNOWN"
         )
@@ -486,167 +617,8 @@ class DiskManager:
         data_output = await self.coordinator.run_command(f"smartctl -A {device_path}")
         self.logger.debug("smartctl -A output for %s: %s", disk_info["device"], data_output[:200] + "..." if len(data_output) > 200 else data_output)
         
-        # 智能温度检测逻辑 - 处理多温度属性
-        temp_patterns = [
-            # 新增的NVMe专用模式
-            r"Temperature:\s*(\d+)\s*Celsius",  # 匹配 NVMe 格式
-            r"Composite:\s*\+?(\d+\.?\d*)°C",    # 匹配 NVMe 复合温度
-            # 优先匹配属性194行（通常包含当前温度）
-            r"194\s+Temperature_Celsius\s+.*?(\d+)\s*(?:$|$)",
-            
-            # 匹配其他温度属性
-            r"\bTemperature_Celsius\b.*?(\d+)\b",
-            r"Current Temperature:\s*(\d+)",
-            r"Airflow_Temperature_Cel\b.*?(\d+)\b",
-            r"Temp\s*[=:]\s*(\d+)"
-        ]
-        
-        # 查找所有温度值
-        temperatures = []
-        for pattern in temp_patterns:
-            matches = re.findall(pattern, data_output, re.IGNORECASE | re.MULTILINE)
-            if matches:
-                for match in matches:
-                    try:
-                        temperatures.append(int(match))
-                    except ValueError:
-                        pass
-        
-        # 优先选择属性194的温度值，如果没有则选择最大值
-        if temperatures:
-            # 优先选择属性194的值（如果存在）
-            primary_match = re.search(r"194\s+Temperature_Celsius\s+.*?(\d+)\s*(?:\(|$)", 
-                                    data_output, re.IGNORECASE | re.MULTILINE)
-            if primary_match:
-                disk_info["temperature"] = f"{primary_match.group(1)} °C"
-            else:
-                # 选择最高温度值（通常是当前温度）
-                disk_info["temperature"] = f"{max(temperatures)} °C"
-        else:
-            disk_info["temperature"] = "未知"
-        
-        # 改进的通电时间检测逻辑 - 处理特殊格式
-        power_on_hours = "未知"
-        
-        # 检查是否为NVMe设备
-        is_nvme = "nvme" in disk_info["device"].lower()
-        
-        # 方法0：NVMe设备的通电时间提取（优先处理）
-        if is_nvme:
-            # NVMe格式的通电时间提取 - 支持带逗号的数字格式
-            nvme_patterns = [
-                r"Power On Hours\s*:\s*([\d,]+)",  # 支持带逗号的数字格式（如 "6,123"）
-                r"Power On Time\s*:\s*([\d,]+)",  # NVMe备用格式
-                r"Power on hours\s*:\s*([\d,]+)",  # 小写格式
-                r"Power on time\s*:\s*([\d,]+)",  # 小写格式
-            ]
-            
-            for pattern in nvme_patterns:
-                match = re.search(pattern, data_output, re.IGNORECASE)
-                if match:
-                    try:
-                        # 处理带逗号的数字格式（如 "6,123"）
-                        hours_str = match.group(1).replace(',', '')
-                        hours = int(hours_str)
-                        power_on_hours = f"{hours} 小时"
-                        self.logger.debug("Found NVMe power_on_hours via pattern %s: %s", pattern, power_on_hours)
-                        break
-                    except:
-                        continue
-            
-            # 如果还没找到，尝试在SMART数据部分查找
-            if power_on_hours == "未知":
-                # 查找SMART数据部分中的Power On Hours
-                smart_section_match = re.search(r"SMART/Health Information.*?Power On Hours\s*:\s*([\d,]+)", 
-                                               data_output, re.IGNORECASE | re.DOTALL)
-                if smart_section_match:
-                    try:
-                        hours_str = smart_section_match.group(1).replace(',', '')
-                        hours = int(hours_str)
-                        power_on_hours = f"{hours} 小时"
-                        self.logger.debug("Found NVMe power_on_hours in SMART section: %s", power_on_hours)
-                    except:
-                        pass
-        
-        # 方法1：提取属性9的RAW_VALUE（处理特殊格式）
-        attr9_match = re.search(
-            r"^\s*9\s+Power_On_Hours\b[^\n]+\s+(\d+)h(?:\+(\d+)m(?:\+(\d+)\.\d+s)?)?",
-            data_output, re.IGNORECASE | re.MULTILINE
-        )
-        if attr9_match:
-            try:
-                hours = int(attr9_match.group(1))
-                # 如果有分钟部分，转换为小时的小数部分
-                if attr9_match.group(2):
-                    minutes = int(attr9_match.group(2))
-                    hours += minutes / 60
-                power_on_hours = f"{hours:.1f} 小时"
-                self.logger.debug("Found power_on_hours via method1: %s", power_on_hours)
-            except:
-                pass
-        
-        # 方法2：如果方法1失败，尝试提取纯数字格式
-        if power_on_hours == "未知":
-            attr9_match = re.search(
-                r"^\s*9\s+Power_On_Hours\b[^\n]+\s+(\d+)\s*$",
-                data_output, re.IGNORECASE | re.MULTILINE
-            )
-            if attr9_match:
-                try:
-                    power_on_hours = f"{int(attr9_match.group(1))} 小时"
-                    self.logger.debug("Found power_on_hours via method2: %s", power_on_hours)
-                except:
-                    pass
-        
-        # 方法3：如果前两种方法失败，使用原来的多模式匹配
-        if power_on_hours == "未知":
-            power_on_hours = self.extract_value(
-                data_output,
-                [
-                    # 精确匹配属性9行
-                    r"^\s*9\s+Power_On_Hours\b[^\n]+\s+(\d+)\s*$",
-                    r"^\s*9\s+Power On Hours\b[^\n]+\s+(\d+)h(?:\+(\d+)m(?:\+(\d+)\.\d+s)?)?",
-                    # 通用匹配模式
-                    r"9\s+Power_On_Hours\b.*?(\d+)\b",
-                    r"Power_On_Hours\b.*?(\d+)\b",
-                    r"Power On Hours\s+(\d+)",
-                    r"Power on time\s*:\s*(\d+)\s*hours"
-                ],
-                default="未知",
-                format_func=lambda x: f"{int(x)} 小时"
-            )
-            if power_on_hours != "未知":
-                self.logger.debug("Found power_on_hours via method3: %s", power_on_hours)
-        
-        # 方法4：如果还没找到，尝试扫描整个属性表
-        if power_on_hours == "未知":
-            for line in data_output.split('\n'):
-                if "Power_On_Hours" in line:
-                    # 尝试提取特殊格式
-                    match = re.search(r"(\d+)h(?:\+(\d+)m(?:\+(\d+)\.\d+s)?)?", line)
-                    if match:
-                        try:
-                            hours = int(match.group(1))
-                            if match.group(2):
-                                minutes = int(match.group(2))
-                                hours += minutes / 60
-                            power_on_hours = f"{hours:.1f} 小时"
-                            self.logger.debug("Found power_on_hours via method4 (special format): %s", power_on_hours)
-                            break
-                        except:
-                            pass
-                            
-                    # 尝试提取纯数字
-                    fields = line.split()
-                    if fields and fields[-1].isdigit():
-                        try:
-                            power_on_hours = f"{int(fields[-1])} 小时"
-                            self.logger.debug("Found power_on_hours via method4 (numeric): %s", power_on_hours)
-                            break
-                        except:
-                            pass
-        
-        disk_info["power_on_hours"] = power_on_hours
+        disk_info["temperature"] = self._extract_disk_temperature(data_output, is_nvme, is_scsi)
+        disk_info["power_on_hours"] = self._extract_power_on_hours(data_output, is_nvme, is_scsi)
         
         # 添加额外属性：温度历史记录
         temp_history = {}

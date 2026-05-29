@@ -3,7 +3,8 @@ from homeassistant.core import callback
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from .const import DOMAIN, DATA_UPDATE_COORDINATOR, CONF_MAC, DEVICE_ID_NAS
+from .const import DOMAIN, DATA_UPDATE_COORDINATOR, CONF_MAC
+from .entity_helpers import child_identifier, nas_identifier, nas_via_device, sanitize_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -20,19 +21,21 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
                 VMSwitch(
                     coordinator, 
                     vm["name"],
-                    vm.get("title", vm["name"])
+                    vm.get("title", vm["name"]),
+                    config_entry.entry_id
                 )
             )
 
     if coordinator.data.get("docker_containers") and coordinator.enable_docker:
         for container in coordinator.data["docker_containers"]:
             # 使用容器名称作为唯一ID的一部分
-            safe_name = container["name"].replace(" ", "_").replace("/", "_")
+            safe_name = sanitize_id(container["name"])
             entities.append(
                 DockerContainerSwitch(
                     coordinator, 
                     container["name"],
-                    safe_name
+                    safe_name,
+                    config_entry.entry_id
                 )
             )
 
@@ -43,10 +46,10 @@ class PowerSwitch(CoordinatorEntity, SwitchEntity):
         super().__init__(coordinator)
         self.config_entry = config_entry
         self._attr_name = "电源"
-        self._attr_unique_id = "flynas_power"
+        self._attr_unique_id = f"{config_entry.entry_id}_flynas_power"
         self._attr_entity_category = EntityCategory.CONFIG
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, DEVICE_ID_NAS)},
+            "identifiers": {(DOMAIN, nas_identifier(coordinator))},
             "name": "飞牛NAS系统",
             "manufacturer": "飞牛",
             "model": "飞牛NAS"
@@ -100,16 +103,17 @@ class PowerSwitch(CoordinatorEntity, SwitchEntity):
         }
 
 class VMSwitch(CoordinatorEntity, SwitchEntity):
-    def __init__(self, coordinator, vm_name, vm_title):
+    def __init__(self, coordinator, vm_name, vm_title, entry_id):
         super().__init__(coordinator)
         self.vm_name = vm_name
         self.vm_title = vm_title
+        safe_vm_name = sanitize_id(vm_name)
         self._attr_name = f"{vm_title} 电源"
-        self._attr_unique_id = f"flynas_vm_{vm_name}_switch"
+        self._attr_unique_id = f"{entry_id}_flynas_vm_{safe_vm_name}_switch"
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, f"vm_{vm_name}")},
+            "identifiers": {(DOMAIN, child_identifier(coordinator, f"vm_{safe_vm_name}"))},
             "name": vm_title,
-            "via_device": (DOMAIN, DEVICE_ID_NAS)
+            "via_device": nas_via_device(coordinator)
         }
         self.vm_manager = coordinator.vm_manager if hasattr(coordinator, 'vm_manager') else None
     
@@ -162,15 +166,16 @@ class VMSwitch(CoordinatorEntity, SwitchEntity):
 
 # 添加DockerContainerSwitch类
 class DockerContainerSwitch(CoordinatorEntity, SwitchEntity):
-    def __init__(self, coordinator, container_name, safe_name):
+    def __init__(self, coordinator, container_name, safe_name, entry_id):
         super().__init__(coordinator)
         self.container_name = container_name
+        safe_name = sanitize_id(safe_name)
         self._attr_name = f"{container_name} 容器"
-        self._attr_unique_id = f"docker_{safe_name}_switch"
+        self._attr_unique_id = f"{entry_id}_docker_{safe_name}_switch"
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, f"docker_{safe_name}")},
+            "identifiers": {(DOMAIN, child_identifier(coordinator, f"docker_{safe_name}"))},
             "name": container_name,
-            "via_device": (DOMAIN, DEVICE_ID_NAS)
+            "via_device": nas_via_device(coordinator)
         }
 
     @property

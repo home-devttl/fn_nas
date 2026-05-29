@@ -1,6 +1,8 @@
 import logging
 import asyncio
 import os
+import re
+import time
 from datetime import datetime
 
 _LOGGER = logging.getLogger(__name__)
@@ -26,6 +28,9 @@ class SystemManager:
             "temp_id": None,
             "label": None
         }
+        self._last_cpu_sample = None
+        self._last_network_sample = None
+        self._last_storage_sample = None
 
     def _debug_log(self, message: str):
         """只在调试模式下输出详细日志"""
@@ -69,6 +74,9 @@ class SystemManager:
 
             mem_info = await self.get_memory_info()
             system_info.update(mem_info)
+            system_info.update(await self.get_cpu_usage_info())
+            system_info.update(await self.get_network_speed_info())
+            system_info.update(await self.get_storage_speed_info())
             vol_info = await self.get_vol_usage()
             system_info["volumes"] = vol_info
             return system_info
@@ -83,8 +91,258 @@ class SystemManager:
                 "memory_total": "未知",
                 "memory_used": "未知",
                 "memory_available": "未知",
+                "cpu_usage": None,
+                "network_download_speed": None,
+                "network_upload_speed": None,
+                "network_interface": "未知",
+                "storage_read_speed": None,
+                "storage_write_speed": None,
                 "volumes": {}
             }
+
+    async def get_cpu_usage_info(self) -> dict:
+        """获取CPU使用率，基于/proc/stat两次采样差值计算。"""
+        try:
+            stat_output = await self.coordinator.run_command("cat /proc/stat")
+            if not stat_output:
+                return {"cpu_usage": None}
+
+            first_line = stat_output.splitlines()[0].split()
+            if len(first_line) < 5 or first_line[0] != "cpu":
+                return {"cpu_usage": None}
+
+            values = [int(value) for value in first_line[1:]]
+            idle = values[3] + (values[4] if len(values) > 4 else 0)
+            total = sum(values)
+            sample = {"total": total, "idle": idle}
+
+            if not self._last_cpu_sample:
+                self._last_cpu_sample = sample
+                return {"cpu_usage": None}
+
+            total_delta = total - self._last_cpu_sample["total"]
+            idle_delta = idle - self._last_cpu_sample["idle"]
+            self._last_cpu_sample = sample
+
+            if total_delta <= 0:
+                return {"cpu_usage": None}
+
+            cpu_usage = (1 - idle_delta / total_delta) * 100
+            return {"cpu_usage": round(max(0, min(cpu_usage, 100)), 1)}
+        except Exception as e:
+            self._error_log(f"获取CPU使用率失败: {str(e)}")
+            return {"cpu_usage": None}
+
+    async def get_network_speed_info(self) -> dict:
+        """获取网络上传和下载速度，基于/proc/net/dev字节计数差值计算。"""
+        try:
+            command = (
+                "cat /proc/net/dev; "
+                "echo __FN_NAS_NET_MACS__; "
+                "for i in /sys/class/net/*; do "
+                "[ -e \"$i/address\" ] && echo \"$(basename \"$i\") $(cat \"$i/address\")\"; "
+                "done"
+            )
+            output = await self.coordinator.run_command(command)
+            if not output:
+                return self._empty_network_info()
+
+            if "__FN_NAS_NET_MACS__" in output:
+                dev_output, mac_output = output.split("__FN_NAS_NET_MACS__", 1)
+            else:
+                dev_output, mac_output = output, ""
+
+            net_stats = self.parse_network_dev(dev_output)
+            interface_macs = self.parse_interface_macs(mac_output)
+            selected_interfaces = self.select_network_interfaces(net_stats, interface_macs)
+            if not selected_interfaces:
+                return self._empty_network_info()
+
+            rx_bytes = sum(net_stats[iface]["rx_bytes"] for iface in selected_interfaces)
+            tx_bytes = sum(net_stats[iface]["tx_bytes"] for iface in selected_interfaces)
+            now = time.monotonic()
+            sample = {
+                "time": now,
+                "rx_bytes": rx_bytes,
+                "tx_bytes": tx_bytes,
+                "interfaces": selected_interfaces,
+            }
+
+            interface_name = ",".join(selected_interfaces)
+            if not self._last_network_sample:
+                self._last_network_sample = sample
+                return {
+                    "network_download_speed": None,
+                    "network_upload_speed": None,
+                    "network_interface": interface_name,
+                }
+
+            elapsed = now - self._last_network_sample["time"]
+            rx_delta = rx_bytes - self._last_network_sample["rx_bytes"]
+            tx_delta = tx_bytes - self._last_network_sample["tx_bytes"]
+            self._last_network_sample = sample
+
+            if elapsed <= 0 or rx_delta < 0 or tx_delta < 0:
+                return {
+                    "network_download_speed": None,
+                    "network_upload_speed": None,
+                    "network_interface": interface_name,
+                }
+
+            return {
+                "network_download_speed": round(rx_delta / elapsed / (1024 ** 2), 2),
+                "network_upload_speed": round(tx_delta / elapsed / (1024 ** 2), 2),
+                "network_interface": interface_name,
+            }
+        except Exception as e:
+            self._error_log(f"获取网络速度失败: {str(e)}")
+            return self._empty_network_info()
+
+    def _empty_network_info(self) -> dict:
+        return {
+            "network_download_speed": None,
+            "network_upload_speed": None,
+            "network_interface": "未知",
+        }
+
+    def parse_network_dev(self, output: str) -> dict:
+        """解析/proc/net/dev输出。"""
+        stats = {}
+        for line in output.splitlines():
+            if ":" not in line:
+                continue
+            iface, values = line.split(":", 1)
+            fields = values.split()
+            if len(fields) < 16:
+                continue
+            try:
+                stats[iface.strip()] = {
+                    "rx_bytes": int(fields[0]),
+                    "tx_bytes": int(fields[8]),
+                }
+            except ValueError:
+                continue
+        return stats
+
+    def parse_interface_macs(self, output: str) -> dict:
+        """解析网卡和MAC地址映射。"""
+        interface_macs = {}
+        for line in output.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                interface_macs[parts[0]] = parts[1].lower()
+        return interface_macs
+
+    def select_network_interfaces(self, net_stats: dict, interface_macs: dict) -> list:
+        """优先使用配置的MAC对应网卡，否则汇总物理网卡。"""
+        configured_mac = getattr(self.coordinator, "mac", "")
+        configured_mac = configured_mac.lower() if configured_mac else ""
+        if configured_mac:
+            for iface, mac in interface_macs.items():
+                if mac == configured_mac and iface in net_stats:
+                    return [iface]
+
+        ignored_prefixes = (
+            "lo", "docker", "veth", "br-", "virbr", "tun", "tap", "wg",
+            "tailscale", "zt", "hassio",
+        )
+        physical_prefixes = ("eth", "en", "bond", "wlan", "wl")
+        candidates = []
+        for iface in net_stats:
+            if iface.startswith(ignored_prefixes):
+                continue
+            if iface.startswith(physical_prefixes):
+                candidates.append(iface)
+        return candidates
+
+    async def get_storage_speed_info(self) -> dict:
+        """获取整体存储读写速度，基于/proc/diskstats扇区计数差值计算。"""
+        try:
+            output = await self.coordinator.run_command("cat /proc/diskstats")
+            if not output:
+                return self._empty_storage_info()
+
+            disk_stats = self.parse_diskstats(output)
+            if not disk_stats:
+                return self._empty_storage_info()
+
+            read_sectors = sum(stat["read_sectors"] for stat in disk_stats.values())
+            write_sectors = sum(stat["write_sectors"] for stat in disk_stats.values())
+            now = time.monotonic()
+            sample = {
+                "time": now,
+                "read_sectors": read_sectors,
+                "write_sectors": write_sectors,
+            }
+
+            if not self._last_storage_sample:
+                self._last_storage_sample = sample
+                return self._empty_storage_info()
+
+            elapsed = now - self._last_storage_sample["time"]
+            read_delta = read_sectors - self._last_storage_sample["read_sectors"]
+            write_delta = write_sectors - self._last_storage_sample["write_sectors"]
+            self._last_storage_sample = sample
+
+            if elapsed <= 0 or read_delta < 0 or write_delta < 0:
+                return self._empty_storage_info()
+
+            sector_size = 512
+            return {
+                "storage_read_speed": round(read_delta * sector_size / elapsed / (1024 ** 2), 2),
+                "storage_write_speed": round(write_delta * sector_size / elapsed / (1024 ** 2), 2),
+            }
+        except Exception as e:
+            self._error_log(f"获取存储读写速度失败: {str(e)}")
+            return self._empty_storage_info()
+
+    def _empty_storage_info(self) -> dict:
+        return {
+            "storage_read_speed": None,
+            "storage_write_speed": None,
+        }
+
+    def parse_diskstats(self, output: str) -> dict:
+        """解析/proc/diskstats，只统计物理整盘设备。"""
+        stats = {}
+        ignored_prefixes = (
+            "loop", "ram", "dm-", "md", "zram", "sr", "fd", "zd", "rbd",
+        )
+
+        for line in output.splitlines():
+            fields = line.split()
+            if len(fields) < 14:
+                continue
+
+            device = fields[2]
+            if device.startswith(ignored_prefixes):
+                continue
+            if self.is_partition_device(device):
+                continue
+
+            try:
+                stats[device] = {
+                    "read_sectors": int(fields[5]),
+                    "write_sectors": int(fields[9]),
+                }
+            except (ValueError, IndexError):
+                continue
+
+        return stats
+
+    def is_partition_device(self, device: str) -> bool:
+        """判断diskstats设备名是否为分区而非整盘。"""
+        if re.match(r"^sd[a-z]+\d+$", device):
+            return True
+        if re.match(r"^vd[a-z]+\d+$", device):
+            return True
+        if re.match(r"^xvd[a-z]+\d+$", device):
+            return True
+        if re.match(r"^nvme\d+n\d+p\d+$", device):
+            return True
+        if re.match(r"^mmcblk\d+p\d+$", device):
+            return True
+        return False
 
     async def get_temperatures_from_sensors(self) -> dict:
         """一次性获取CPU和主板温度"""
